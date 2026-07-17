@@ -309,14 +309,18 @@ export async function processNonStreamingResponse(
                     chunk["response.created"] &&
                     chunk["response.created"].response_id
                   ) {
+                    if (chunk["response.created"].chat_id) {
+                      rememberSession(chunk["response.created"].chat_id);
+                    }
                     if (!targetResponseId) {
                       targetResponseId = chunk["response.created"].response_id;
                     }
+                    // Next turn appends with parent_id = this assistant response
                     rememberParent(chunk["response.created"].response_id);
                   } else if (chunk.response_id && !targetResponseId) {
-            targetResponseId = chunk.response_id;
-            rememberParent(chunk.response_id);
-          }
+                    targetResponseId = chunk.response_id;
+                    rememberParent(chunk.response_id);
+                  }
 
           applyUpstreamUsage(usageAccumulator, chunk.usage);
 
@@ -630,7 +634,7 @@ export async function processStreamingResponse(
       clientDisconnected = true;
 
       console.log(
-        `[Chat] Client disconnected for ${completionId}, stopping Qwen generation...`,
+        `🔌 [Chat] Client disconnected | ${completionId} | stopping Qwen generation`,
       );
 
       if (isToolcallDebugEnabled()) {
@@ -646,7 +650,7 @@ export async function processStreamingResponse(
           const targetResponseId = streamData.targetResponseId;
           if (targetResponseId) {
             console.log(
-              `[Chat] Calling Qwen stop for session=${currentUiSessionId}, response=${targetResponseId}`,
+              `🛑 [Chat] Stopping Qwen generation | session=${currentUiSessionId} | response=${targetResponseId}`,
             );
             await fetch(
               `https://chat.qwen.ai/api/v2/chat/completions/stop?chat_id=${currentUiSessionId}`,
@@ -667,12 +671,12 @@ export async function processStreamingResponse(
               },
             ).catch((err) => {
               console.error(
-                `❌ [Chat] Error calling Qwen stop: ${err.message}`,
+                `❌ [Chat] Stop failed | ${err.message}`,
               );
             });
           } else {
             console.log(
-              `[Chat] No targetResponseId yet for ${completionId}, skipping Qwen stop`,
+              `⏭️  [Chat] Skip Qwen stop | ${completionId} | no response_id yet`,
             );
           }
         }
@@ -682,13 +686,13 @@ export async function processStreamingResponse(
         } catch (abortErr: any) {
           if (abortErr.name !== "AbortError") {
             console.error(
-              `❌ [Chat] Error aborting stream: ${abortErr.message}`,
+              `❌ [Chat] Abort stream failed | ${abortErr.message}`,
             );
           }
         }
       } catch (err: any) {
         console.error(
-          `❌ [Chat] Error during disconnect cleanup: ${err.message}`,
+          `❌ [Chat] Disconnect cleanup failed | ${err.message}`,
         );
       }
 
@@ -1033,15 +1037,24 @@ export async function processStreamingResponse(
                         chunk["response.created"] &&
                         chunk["response.created"].response_id
                       ) {
+                        // chat_id first so rememberParent can bind sticky state
+                        if (chunk["response.created"].chat_id) {
+                          rememberSession(chunk["response.created"].chat_id);
+                        }
                         if (!targetResponseId) {
                           targetResponseId = chunk["response.created"].response_id;
                           if (targetResponseId) {
                             updateStreamTargetResponseId(completionId, targetResponseId);
                           }
                         }
-                        if (chunk["response.created"].chat_id) {
-                          rememberSession(chunk["response.created"].chat_id);
+                        // Next turn must parent to this assistant response (append, not edit)
+                        rememberParent(chunk["response.created"].response_id);
+                      } else if (chunk.response_id && !targetResponseId) {
+                        targetResponseId = chunk.response_id;
+                        if (targetResponseId) {
+                          updateStreamTargetResponseId(completionId, targetResponseId);
                         }
+                        rememberParent(chunk.response_id);
                       }
 
             applyUpstreamUsage(usageAccumulator, chunk.usage);
