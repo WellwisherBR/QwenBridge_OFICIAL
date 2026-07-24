@@ -103,9 +103,6 @@ export async function chatCompletions(c: Context) {
 
     const personalizationChars =
       ctx.requestPersonalizationInstruction?.length ?? 0;
-    console.log(
-      `📤 [Chat] Request | ${body.model} | ${msgCount} msg(s) | ${finalPrompt.length} chars${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""}`,
-    );
     logger.debug("[chat] request routing details", {
       model: body.model,
       messages: msgCount,
@@ -153,6 +150,7 @@ export async function chatCompletions(c: Context) {
       fullMessageCount: parsed.messageCount,
       toolsCount: declaredTools.length || undefined,
       requestPersonalizationInstruction: ctx.requestPersonalizationInstruction,
+      requestSignal: c.req.raw.signal,
     });
 
 
@@ -181,7 +179,7 @@ export async function chatCompletions(c: Context) {
     }
 
     console.log(
-      `🚀 [Chat] Request routed | ${streamResult.activeAccountLabel} | ${body.model} | ${msgCount} msg(s) | ${finalPrompt.length} chars${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""}`,
+      `📤 [Chat] Request | ${streamResult.activeAccountLabel} | ${body.model} | ${msgCount} msg(s) | ${finalPrompt.length} chars | chat=${streamResult.uiSessionId.substring(0, 12)}${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""}`,
     );
 
     const onAssistantComplete: ((event: AssistantCompleteEvent) => Promise<void> | void) | undefined = undefined;
@@ -200,12 +198,29 @@ export async function chatCompletions(c: Context) {
       shouldParseToolCalls,
       declaredTools,
       tokenEstimationContext: streamResult.tokenEstimationContext,
+      midStreamRetry: {
+        fullPrompt: fullPromptForRequest,
+        isThinkingModel: ctx.isThinkingModel,
+        allFiles: files,
+        isNewSession: ctx.isNewSession,
+        sessionId: ctx.sessionId,
+        useThreadNative: ctx.useThreadNative,
+        updateLogicalThread: ctx.updateLogicalThread,
+        allowThreadReuse: ctx.allowThreadReuse,
+        messageCount: msgCount,
+        fullMessageCount: parsed.messageCount,
+        toolsCount: declaredTools.length || undefined,
+        requestPersonalizationInstruction:
+          ctx.requestPersonalizationInstruction,
+        releaseAccountLease: streamResult.releaseAccountLease,
+      },
       onAssistantComplete,
       onStreamComplete: () => {
         if (releaseChatLock) {
           releaseChatLock();
           releaseChatLock = null;
         }
+        streamResult.releaseAccountLease();
       },
     };
 
@@ -253,11 +268,12 @@ export async function chatCompletions(c: Context) {
               );
             }
 
-            // Release current chat lock
+            // Release current chat lock and account lease before retrying
             if (releaseChatLock) {
               releaseChatLock();
               releaseChatLock = null;
             }
+            currentStreamResult.releaseAccountLease();
 
             // Account switch always rebuilds full history; same-account retry
             // only does so when the policy asks for forceNewChat/full prompt.
@@ -313,6 +329,7 @@ export async function chatCompletions(c: Context) {
               toolsCount: declaredTools.length || undefined,
               requestPersonalizationInstruction:
                 ctx.requestPersonalizationInstruction,
+              requestSignal: c.req.raw.signal,
             });
 
             if ("error" in newStreamResult) {
@@ -321,7 +338,7 @@ export async function chatCompletions(c: Context) {
             }
 
             console.log(
-              `🔄 [Chat] Request routed | ${newStreamResult.activeAccountLabel} | ${body.model} | ${retryMessageCount} msg(s) | ${retryFinalPrompt.length} chars${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""} | retry`,
+              `🔄 [Chat] Request routed | ${newStreamResult.activeAccountLabel} | ${body.model} | ${retryMessageCount} msg(s) | ${retryFinalPrompt.length} chars | chat=${newStreamResult.uiSessionId.substring(0, 12)}${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""} | retry`,
             );
 
             // Re-acquire chat lock for new stream
@@ -348,12 +365,29 @@ export async function chatCompletions(c: Context) {
               shouldParseToolCalls,
               declaredTools,
               tokenEstimationContext: newStreamResult.tokenEstimationContext,
+              midStreamRetry: {
+                fullPrompt: fullPromptForRequest,
+                isThinkingModel: ctx.isThinkingModel,
+                allFiles: files,
+                isNewSession: ctx.isNewSession,
+                sessionId: ctx.sessionId,
+                useThreadNative: ctx.useThreadNative,
+                updateLogicalThread: ctx.updateLogicalThread,
+                allowThreadReuse: ctx.allowThreadReuse,
+                messageCount: retryMessageCount,
+                fullMessageCount: parsed.messageCount,
+                toolsCount: declaredTools.length || undefined,
+                requestPersonalizationInstruction:
+                  ctx.requestPersonalizationInstruction,
+                releaseAccountLease: newStreamResult.releaseAccountLease,
+              },
               onAssistantComplete,
               onStreamComplete: () => {
                 if (releaseChatLock) {
                   releaseChatLock();
                   releaseChatLock = null;
                 }
+                newStreamResult.releaseAccountLease();
               },
             };
             continue;

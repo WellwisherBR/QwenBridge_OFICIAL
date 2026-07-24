@@ -15,10 +15,14 @@ import {
   updateSessionParent,
   RetryableQwenStreamError,
 } from "../../services/qwen.ts";
+import { acquireUpstreamStream } from "./account.ts";
+import { markAccountRateLimited } from "../../core/account-manager.ts";
+import { classifyRetryAction } from "./retry-policy.ts";
 import type { OpenAIRequest, Usage } from "../../utils/types.ts";
 import { StreamingToolParser } from "../../tools/parser.ts";
 import {
   getStream,
+  registerStream,
   removeStream,
   updateStreamSessionId,
   updateStreamTargetResponseId,
@@ -115,6 +119,21 @@ export interface StreamProcessingParams {
   shouldParseToolCalls: boolean;
   declaredTools: any[];
   tokenEstimationContext?: TokenEstimationContext;
+  midStreamRetry?: {
+    fullPrompt: string;
+    isThinkingModel: boolean;
+    allFiles: any[];
+    isNewSession: boolean;
+    sessionId: string | null;
+    useThreadNative: boolean;
+    updateLogicalThread: boolean;
+    allowThreadReuse: boolean;
+    messageCount: number;
+    fullMessageCount: number;
+    toolsCount?: number;
+    requestPersonalizationInstruction?: string | null;
+    releaseAccountLease: () => void;
+  };
   onAssistantComplete?: AssistantCompleteHandler;
   onStreamComplete?: () => void;
 }
@@ -178,9 +197,7 @@ export async function processNonStreamingResponse(
       : null;
     const toolCallsOut: any[] = [];
             let buffer = "";
-    const usageAccumulator = createUsageAccumulator(
-      Math.ceil(finalPrompt.length / 3.5),
-    );
+    const usageAccumulator = createUsageAccumulator(0);
 
     const rememberSession = (sessionId: string | null) => {
       if (!sessionId || sessionId === currentUiSessionId) return;
@@ -438,6 +455,39 @@ export async function processNonStreamingResponse(
 
     const finishReason = toolCallsOut.length ? "tool_calls" : "stop";
 
+    // Check for malformed tool calls and inject error feedback
+    if (toolParser && toolParser.getMalformedToolCalls().length > 0) {
+      const malformedCalls = toolParser.getMalformedToolCalls();
+      const malformedCount = malformedCalls.length;
+
+      // Build detailed error message
+      const undeclaredNames = malformedCalls
+        .flatMap((mc) => mc.undeclaredNames || [])
+        .filter((name, index, self) => self.indexOf(name) === index);
+
+      let errorMessage: string;
+      if (undeclaredNames.length > 0) {
+        errorMessage = `\n\n⚠️ [ERROR] ${malformedCount} tool call(s) used undeclared tool names: ${undeclaredNames.join(", ")}. Only declared tools can be executed. Please retry with valid tool names.\n\n`;
+      } else {
+        errorMessage = `\n\n⚠️ [ERROR] ${malformedCount} tool call(s) were malformed and could not be executed. The model generated invalid JSON. Please retry the request.\n\n`;
+      }
+
+      finalContent += errorMessage;
+      if (message.content) {
+        message.content += errorMessage;
+      } else {
+        message.content = errorMessage;
+      }
+
+      logger.debug("[chat] non-stream: injected malformed tool call error feedback", {
+        malformedCount,
+        undeclaredNames,
+        completionId,
+      });
+
+      toolParser.clearMalformedToolCalls();
+    }
+
     if (isToolcallDebugEnabled()) {
       logger.debug("[chat] non-stream: sending response", {
         completionId,
@@ -449,9 +499,6 @@ export async function processNonStreamingResponse(
       });
     }
 
-    console.log(
-      `✅ [Chat] Response sent | ${activeAccountLabel} | ${usage.prompt_tokens} prompt / ${usage.completion_tokens} completion / ${usage.total_tokens} total tokens`,
-    );
     logTokenEstimationSample({
       model: body.model,
       finalPrompt,
@@ -520,6 +567,7 @@ export async function processStreamingResponse(
     shouldParseToolCalls,
     declaredTools,
     tokenEstimationContext,
+    midStreamRetry,
     onAssistantComplete,
     onStreamComplete,
   } = params;
@@ -573,10 +621,21 @@ export async function processStreamingResponse(
     c.header("Cache-Control", "no-cache");
     c.header("Connection", "keep-alive");
 
+  // Store retry context for transparent mid-stream recovery
+  const retryContext = {
+    activeAccountId,
+    activeAccountLabel: activeAccountLabel || activeAccountId,
+    uiSessionId,
+    retriesLeft: Math.max(0, config.retry.maxAttempts - 1),
+    releaseAccountLease: midStreamRetry?.releaseAccountLease ?? null,
+  };
+
   return honoStream(c, async (streamWriter: any) => {
     let heartbeatTimeout: NodeJS.Timeout | undefined;
     let clientDisconnected = false;
-    let currentUiSessionId = uiSessionId;
+    let currentUiSessionId = retryContext.uiSessionId;
+    let currentAccountId = retryContext.activeAccountId;
+    let currentAccountLabel = retryContext.activeAccountLabel;
 
     const abortHandler = async () => {
       if (clientDisconnected) return;
@@ -653,6 +712,23 @@ export async function processStreamingResponse(
 
     c.req.raw.signal.addEventListener("abort", abortHandler);
 
+    // Micro-buffer: coalesce many tiny SSE writes into fewer socket writes to cut
+    // syscall overhead on long responses. Ordering is preserved because EVERY write
+    // (content, reasoning, events, [DONE]) goes through this single buffer.
+    let writeBuffer = '';
+    let writeTimer: ReturnType<typeof setTimeout> | null = null;
+    const WRITE_FLUSH_BYTES = 8192;
+    const WRITE_FLUSH_MS = 3;
+
+    const flushWrites = () => {
+      if (writeTimer) { clearTimeout(writeTimer); writeTimer = null; }
+      if (writeBuffer) {
+        const data = writeBuffer;
+        writeBuffer = '';
+        streamWriter.write(data);
+      }
+    };
+
     try {
       await streamWriter.write(": heartbeat\n\n");
 
@@ -674,6 +750,15 @@ export async function processStreamingResponse(
 
       const createdTimestamp = Math.floor(Date.now() / 1000);
 
+      const bufferedWrite = (data: string) => {
+        writeBuffer += data;
+        if (writeBuffer.length >= WRITE_FLUSH_BYTES) {
+          flushWrites();
+        } else if (!writeTimer) {
+          writeTimer = setTimeout(flushWrites, WRITE_FLUSH_MS);
+        }
+      };
+
       // Batch buffer: when non-null, writeEvent accumulates instead of flushing
       let flushBuffer: string[] | null = null;
 
@@ -683,7 +768,7 @@ export async function processStreamingResponse(
           flushBuffer.push(serialized);
           return;
         }
-        await streamWriter.write(serialized);
+        bufferedWrite(serialized);
       };
 
       const makeChoice = (delta: any, finishReason: string | null = null) => ({
@@ -702,7 +787,7 @@ export async function processStreamingResponse(
         choices: [makeChoice({ role: "assistant", content: "" })],
       });
 
-      const reader = streamReader;
+      let reader: ReadableStreamDefaultReader<Uint8Array> = streamReader;
       const decoder = new TextDecoder();
 
       let lastThinkingSummary = "";
@@ -713,6 +798,7 @@ export async function processStreamingResponse(
       let lastRawContentSuffix = "";
       let finalContent = "";
       let reasoningBuffer = "";
+      let emittedModelOutput = false;
       let targetResponseId: string | null = null;
       const toolParser = shouldParseToolCalls
         ? new StreamingToolParser(declaredTools, {
@@ -721,9 +807,7 @@ export async function processStreamingResponse(
         : null;
 
       let buffer = initialStreamBuffer;
-      const usageAccumulator = createUsageAccumulator(
-        Math.ceil(finalPrompt.length / 3.5),
-      );
+      const usageAccumulator = createUsageAccumulator(0);
       const rememberSession = (sessionId: string | null) => {
         if (!sessionId || sessionId === currentUiSessionId) return;
         currentUiSessionId = sessionId;
@@ -732,16 +816,17 @@ export async function processStreamingResponse(
 
       const rememberParent = (parentId: string) => {
         if (!currentUiSessionId) return;
-        updateSessionParent(currentUiSessionId, parentId, activeAccountId);
+        updateSessionParent(currentUiSessionId, parentId, currentAccountId);
         updateLogicalThreadParent(
           logicalSessionId,
           parentId,
-          activeAccountId,
+          currentAccountId,
           currentUiSessionId,
         );
       };
 
       const emitAnswerText = async (textChunk: string) => {
+        if (textChunk) emittedModelOutput = true;
         if (!toolParser) {
           finalContent += textChunk;
           await writeEvent({
@@ -755,6 +840,9 @@ export async function processStreamingResponse(
         }
 
         const { text, toolCalls, toolCallDeltas } = toolParser.feed(textChunk);
+        if (text || toolCalls.length > 0 || toolCallDeltas.length > 0) {
+          emittedModelOutput = true;
+        }
 
         if (
           isToolcallDebugEnabled() &&
@@ -892,7 +980,7 @@ export async function processStreamingResponse(
             if (!clientDisconnected) {
               await streamWriter.write("data: [DONE]\n\n");
             }
-            continue;
+            break; // Exit loop immediately - no need to wait for connection close
           }
 
           if (upstreamDebugEnabled) {
@@ -1024,6 +1112,7 @@ export async function processStreamingResponse(
               if (vStr === "FINISHED") continue;
 
               if (isThinkingChunk) {
+                emittedModelOutput = true;
                 reasoningBuffer += vStr;
                 await writeEvent({
                   id: completionId,
@@ -1037,12 +1126,114 @@ export async function processStreamingResponse(
               }
             }
           } catch (_e) {
-                      // Re-throw policy-driven retry errors for outer retry loop
-                      if (_e instanceof RetryableQwenStreamError) {
-                        throw _e;
-                      }
-                      // Ignore partial chunk parse errors
-                    }
+            if (
+              _e instanceof RetryableQwenStreamError &&
+              retryContext.retriesLeft > 0 &&
+              midStreamRetry &&
+              !emittedModelOutput
+            ) {
+              const policy = classifyRetryAction(_e);
+              if (policy.retryable) {
+                retryContext.retriesLeft--;
+                console.warn(
+                  `[Chat] Stream mid-stream error, retrying transparently | reason=${policy.reason} | ${_e.message?.substring(0, 150)} | retries left: ${retryContext.retriesLeft}`,
+                );
+
+                if (policy.accountCooldownMs || policy.accountCooldownReason) {
+                  markAccountRateLimited(
+                    currentAccountId,
+                    policy.accountCooldownMs,
+                    policy.accountCooldownReason || "StreamRetry",
+                  );
+                }
+
+                retryContext.releaseAccountLease?.();
+                retryContext.releaseAccountLease = null;
+                await reader.cancel().catch(() => undefined);
+                removeStream(completionId);
+
+                if (policy.retryAfterMs > 0) {
+                  await new Promise((resolve) =>
+                    setTimeout(resolve, Math.min(policy.retryAfterMs, 3000)),
+                  );
+                }
+
+                const switchAccount = policy.switchAccount;
+                const forceRetryNewChat = policy.forceNewChat;
+                const needsFullPrompt =
+                  policy.retryWithFullPrompt || switchAccount || forceRetryNewChat;
+
+                const newStreamResult = await acquireUpstreamStream({
+                  finalPrompt: needsFullPrompt
+                    ? midStreamRetry.fullPrompt
+                    : finalPrompt,
+                  fullPrompt: midStreamRetry.fullPrompt,
+                  isThinkingModel: midStreamRetry.isThinkingModel,
+                  model: body.model,
+                  shouldResetUpstreamThread: needsFullPrompt,
+                  allFiles: policy.dropFiles ? [] : midStreamRetry.allFiles,
+                  isNewSession: midStreamRetry.isNewSession,
+                  sessionId: midStreamRetry.sessionId,
+                  useThreadNative: midStreamRetry.useThreadNative,
+                  updateLogicalThread: midStreamRetry.updateLogicalThread,
+                  allowThreadReuse: midStreamRetry.allowThreadReuse,
+                  forceNewChat: forceRetryNewChat || switchAccount,
+                  preferredAccountId: switchAccount ? null : currentAccountId,
+                  excludeAccountIds: switchAccount
+                    ? [currentAccountId]
+                    : undefined,
+                  messageCount: needsFullPrompt
+                    ? midStreamRetry.fullMessageCount
+                    : midStreamRetry.messageCount,
+                  fullMessageCount: midStreamRetry.fullMessageCount,
+                  toolsCount: midStreamRetry.toolsCount,
+                  requestPersonalizationInstruction:
+                    midStreamRetry.requestPersonalizationInstruction,
+                  requestSignal: c.req.raw.signal,
+                  allowTemporarilyBusyAccountId: currentAccountId,
+                });
+
+                if ("error" in newStreamResult) {
+                  throw _e;
+                }
+
+                const newEntry = getStream(newStreamResult.completionId);
+                removeStream(newStreamResult.completionId);
+                if (newEntry) {
+                  registerStream(completionId, {
+                    ...newEntry,
+                    targetResponseId: "",
+                  });
+                }
+
+                currentAccountId = newStreamResult.activeAccountId;
+                currentAccountLabel = newStreamResult.activeAccountLabel;
+                currentUiSessionId = newStreamResult.uiSessionId;
+                retryContext.releaseAccountLease =
+                  newStreamResult.releaseAccountLease;
+                targetResponseId = null;
+                lastThinkingSummary = "";
+                lastThinkingSummaryLength = 0;
+                lastThinkingSummarySuffix = "";
+                lastRawContent = "";
+                lastRawContentLength = 0;
+                lastRawContentSuffix = "";
+                Object.assign(usageAccumulator, createUsageAccumulator(0));
+                reader = newStreamResult.stream.getReader();
+                buffer = "";
+
+                console.log(
+                  `🔄 [Chat] Transparent retry acquired stream | ${currentAccountLabel} | ${body.model} | chat=${currentUiSessionId.substring(0, 12)}`,
+                );
+                continue;
+              }
+            }
+
+            if (_e instanceof RetryableQwenStreamError) {
+              throw _e;
+            }
+            // Ignore partial chunk parse errors.
+          }
         }
 
         buffer = lineStart > 0 ? buffer.slice(lineStart) : buffer;
@@ -1223,6 +1414,40 @@ export async function processStreamingResponse(
       }
 
       if (!clientDisconnected) {
+        // Check for malformed tool calls and inject error feedback
+        if (toolParser && toolParser.getMalformedToolCalls().length > 0) {
+          const malformedCalls = toolParser.getMalformedToolCalls();
+          const malformedCount = malformedCalls.length;
+
+          // Build detailed error message
+          const undeclaredNames = malformedCalls
+            .flatMap((mc) => mc.undeclaredNames || [])
+            .filter((name, index, self) => self.indexOf(name) === index);
+
+          let errorMessage: string;
+          if (undeclaredNames.length > 0) {
+            errorMessage = `\n\n⚠️ [ERROR] ${malformedCount} tool call(s) used undeclared tool names: ${undeclaredNames.join(", ")}. Only declared tools can be executed. Please retry with valid tool names.\n\n`;
+          } else {
+            errorMessage = `\n\n⚠️ [ERROR] ${malformedCount} tool call(s) were malformed and could not be executed. The model generated invalid JSON. Please retry the request.\n\n`;
+          }
+
+          await writeEvent({
+            id: completionId,
+            object: "chat.completion.chunk",
+            created: createdTimestamp,
+            model: body.model,
+            choices: [makeChoice({ content: errorMessage })],
+          });
+
+          logger.debug("[chat] stream: injected malformed tool call error feedback", {
+            malformedCount,
+            undeclaredNames,
+            completionId,
+          });
+
+          toolParser.clearMalformedToolCalls();
+        }
+
         // Single write: flush all accumulated events + [DONE] sentinel
         const donePayload = "data: [DONE]\n\n";
         const payload =
@@ -1236,6 +1461,7 @@ export async function processStreamingResponse(
           });
         }
 
+        flushWrites();
         await streamWriter.write(payload);
         flushBuffer = null;
 
@@ -1263,9 +1489,6 @@ export async function processStreamingResponse(
           });
         }
 
-        console.log(
-          `✅ [Chat] Response sent | ${activeAccountLabel} | ${usage.prompt_tokens} prompt / ${usage.completion_tokens} completion / ${usage.total_tokens} total tokens`,
-        );
         logTokenEstimationSample({
           model: body.model,
           finalPrompt,
@@ -1332,6 +1555,8 @@ export async function processStreamingResponse(
         });
       }
 
+      flushWrites();
+
       c.req.raw.signal.removeEventListener("abort", abortHandler);
       if (heartbeatTimeout) {
         clearTimeout(heartbeatTimeout);
@@ -1346,7 +1571,42 @@ export async function processStreamingResponse(
 
       // Release locks now that the stream is fully done
       if (onStreamComplete) onStreamComplete();
+
+      // Release account lease from transparent retry if active
+      if (retryContext.releaseAccountLease) {
+        retryContext.releaseAccountLease();
+        retryContext.releaseAccountLease = null;
+      }
     }
+  }, async (err: Error, errorStream: any) => {
+    const retryable = err instanceof RetryableQwenStreamError;
+    const errorCode = (err as any).upstreamCode || (err as any).code || "stream_error";
+    const errorType = (err as any).type || "upstream_error";
+
+    if (retryable) {
+      logger.warn("[Chat] Stream ended after retryable error (no more retries)", {
+        code: errorCode,
+        message: err.message?.substring(0, 200),
+        completionId,
+      });
+    } else {
+      logger.error("[Chat] Stream callback error", {
+        error: err.message,
+        completionId,
+      });
+    }
+
+    // The HTTP response is already committed at this point. Emit a terminal
+    // OpenAI-compatible SSE error instead of silently closing the connection.
+    await errorStream.write(
+      `data: ${JSON.stringify({
+        error: {
+          message: err.message,
+          type: errorType,
+          code: errorCode,
+        },
+      })}\n\ndata: [DONE]\n\n`,
+    );
   });
 }
 

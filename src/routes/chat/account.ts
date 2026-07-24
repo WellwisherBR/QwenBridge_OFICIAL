@@ -1,11 +1,13 @@
 import { v4 as uuidv4 } from "uuid";
 import {
 	clearAccountCooldown,
+	formatDateTimeBR,
 	getAccountCooldownInfo,
 	getNextAccount,
 	getNextAvailableAccount,
 	markAccountRateLimited,
 } from "../../core/account-manager.ts";
+import { markAccountSuccessful, markAccountFailed } from "../../core/account-priority.ts";
 import { loadAccounts } from "../../core/accounts.ts";
 import { config } from "../../core/config.ts";
 import { UpstreamRateLimit } from "../../core/errors.ts";
@@ -16,6 +18,12 @@ import {
 } from "../../core/logger.ts";
 import { Mutex } from "../../core/mutex.ts";
 import { registerStream, removeStream } from "../../core/stream-registry.ts";
+import {
+	acquireAccountLease,
+	isAccountTemporarilyBusy,
+	markAccountTemporarilyBusy,
+	type AccountLease,
+} from "../../core/account-concurrency.ts";
 import { isAuthMockEnabled } from "../../services/auth-playwright.ts";
 import { refreshHeaders } from "../../services/playwright.ts";
 import {
@@ -91,6 +99,7 @@ export interface StreamCreationResult {
 	logicalSessionId: string | null;
 	createdNewChat: boolean;
 	tokenEstimationContext: TokenEstimationContext;
+	releaseAccountLease: () => void;
 }
 
 export interface StreamCreationFailure {
@@ -126,6 +135,9 @@ export interface AcquireParams {
 	fullMessageCount?: number;
 	toolsCount?: number;
 	requestPersonalizationInstruction?: string | null;
+	requestSignal?: AbortSignal;
+	/** Allow this request to retry the account it just marked temporarily busy. */
+	allowTemporarilyBusyAccountId?: string;
 }
 
 /** Exported for unit tests — selects the first account for a request. */
@@ -209,9 +221,6 @@ async function tryRecoverAntiBot(
 		const result = await recoverAntiBotChallenge(accountId);
 		if (result.success) {
 			clearAccountCooldown(accountId);
-			console.log(
-				`✅ [Captcha] Recovery ok for ${accountEmail} | method=${result.method} | ${result.durationMs}ms`,
-			);
 			return true;
 		}
 		console.warn(
@@ -314,6 +323,18 @@ export async function acquireUpstreamStream(
 			continue;
 		}
 		triedAccountIds.add(accountId);
+
+		// Skip accounts that recently returned chat_in_progress (temporary busy)
+		if (
+			isAccountTemporarilyBusy(accountId) &&
+			params.allowTemporarilyBusyAccountId !== accountId
+		) {
+			console.log(
+				`⏭️  [Chat] Skipping account ${accountEmail} (${accountId}) temporarily busy (chat in progress)`,
+			);
+			account = getNextAvailableAccount(triedAccountIds);
+			continue;
+		}
 
 		const cooldownInfo = getAccountCooldownInfo(accountId);
 		if (cooldownInfo) {
@@ -423,6 +444,7 @@ export async function acquireUpstreamStream(
 					requestPersonalizationInstruction:
 						params.requestPersonalizationInstruction,
 					fullPrompt: params.fullPrompt,
+					requestSignal: params.requestSignal,
 				},
 				accountId,
 				accountEmail,
@@ -450,6 +472,7 @@ export async function acquireUpstreamStream(
 						...result.tokenEstimationContext,
 						requestDeclaredToolCount: params.toolsCount ?? 0,
 					},
+					releaseAccountLease: result.releaseAccountLease,
 				};
 			}
 
@@ -558,6 +581,7 @@ interface CreateStreamSuccess {
 	headers: Record<string, string>;
 	createdNewChat: boolean;
 	tokenEstimationContext: TokenEstimationContext;
+	releaseAccountLease: () => void;
 }
 
 interface CreateStreamFailure {
@@ -582,6 +606,7 @@ async function tryCreateStreamWithRetry(
 		fullMessageCount?: number;
 		toolsCount?: number;
 		requestPersonalizationInstruction?: string | null;
+		requestSignal?: AbortSignal;
 	},
 	accountId: string,
 	accountEmail: string,
@@ -593,6 +618,7 @@ async function tryCreateStreamWithRetry(
 	let attempt = 0;
 	let quotaRetried = false;
 	let accountSwitches = 0;
+	let chatInProgressCount = 0;
 	const accounts = loadAccounts();
 	const isSingleAccount = accounts.length <= 1;
 	let currentAccountId = accountId;
@@ -607,6 +633,7 @@ async function tryCreateStreamWithRetry(
 			);
 		}
 		let attemptError: any = null;
+		let accountLease: AccountLease | null = null;
 
 		try {
 			const threadParentId = params.useThreadNative
@@ -616,14 +643,23 @@ async function tryCreateStreamWithRetry(
 				: params.shouldResetUpstreamThread
 					? null
 					: undefined;
+			// Acquire account concurrency lease before personalization + stream creation.
+			// The lease is held for the entire stream lifetime and released by the caller
+			// via the returned releaseAccountLease function.
+			accountLease = await acquireAccountLease(currentAccountId, {
+				timeoutMs: config.concurrency.busyWaitMs,
+				signal: params.requestSignal,
+			});
 			const releasePersonalization = params.requestPersonalizationInstruction
 				? await acquirePersonalizationLock(currentAccountId)
 				: null;
 			let result: Awaited<ReturnType<typeof createQwenStream>>;
 			try {
 				if (params.requestPersonalizationInstruction !== null) {
-						// Detect new chat scenarios to force personalization sync
-						const isNewChat = params.forceNewChat || !params.existingThread || params.shouldResetUpstreamThread;
+						// Let the hash-based cache in syncQwenRequestPersonalization decide
+						// whether to actually POST. A new chat does not imply the account's
+						// global settings were reset — only session refresh or profile reset
+						// should bypass the cache.
 						await syncQwenRequestPersonalization(
 							params.requestPersonalizationInstruction ?? "",
 							currentAccountId === "global" ? undefined : currentAccountId,
@@ -632,27 +668,27 @@ async function tryCreateStreamWithRetry(
 								toolsCount: params.toolsCount ?? 0,
 								sessionId: params.sessionId,
 								promptChars: params.finalPrompt.length,
-								forceSync: isNewChat,
+								forceSync: false,
 							},
 						);
 				}
 
 				result = await createQwenStream(
-					params.finalPrompt,
-					params.isThinkingModel,
-					params.model,
-					threadParentId,
-					currentAccountId === "global" ? undefined : currentAccountId,
-					params.allFiles.length > 0 ? params.allFiles : undefined,
-					params.forceNewChat || params.useThreadNative
-						? {
-								chatSessionId: params.forceNewChat
-									? null
-									: (params.existingThread?.chatSessionId ?? null),
-								forceNewChat: false,
-							}
-						: undefined,
-				);
+						params.finalPrompt,
+						params.isThinkingModel,
+						params.model,
+						threadParentId,
+						currentAccountId === "global" ? undefined : currentAccountId,
+						params.allFiles.length > 0 ? params.allFiles : undefined,
+						params.forceNewChat || params.useThreadNative
+							? {
+									chatSessionId: params.forceNewChat
+										? null
+										: (params.existingThread?.chatSessionId ?? null),
+									forceNewChat: false,
+								}
+							: undefined,
+					);
 			} finally {
 				releasePersonalization?.();
 			}
@@ -699,22 +735,30 @@ async function tryCreateStreamWithRetry(
 				});
 			}
 
-			return { success: true, ...result };
+			markAccountSuccessful(currentAccountId);
+			return {
+				success: true,
+				...result,
+				releaseAccountLease: accountLease.release,
+			};
 		} catch (err: any) {
 			attemptError = err;
+			// Release the lease on failure — the stream was never created or
+			// will not be consumed by the caller.
+			accountLease?.release();
 		}
 
 		attemptsLeft--;
 		const err = attemptError;
 
-		// Log the error details for debugging
-		const errMsg = err instanceof Error ? err.message : String(err || "");
-		if (err) {
-			const errCode = err.upstreamCode || err.code || "unknown";
-			console.warn(
-				`❌ [Chat] Request failed | ${currentAccountEmail} | ${errCode} | ${errMsg.substring(0, 200)}`,
-			);
-		}
+		// Log the error details for debugging (skip quota errors — logged separately below)
+			const errMsg = err instanceof Error ? err.message : String(err || "");
+			if (err && !isAccountUnavailableError(err)) {
+				const errCode = err.upstreamCode || err.code || "unknown";
+				console.warn(
+					`❌ [Chat] Request failed | ${currentAccountEmail} | ${errCode} | ${errMsg.substring(0, 200)}`,
+				);
+			}
 
 
 
@@ -759,35 +803,87 @@ async function tryCreateStreamWithRetry(
 		}
 
 		// Account-scoped quota/rate-limit: cool this account and stop local retries
-		// so outer account rotation can pick another one immediately.
-		if (isAccountUnavailableError(err)) {
-			const quotaMsg = err.message || "Unknown quota error";
-			console.warn(
-				`⚠️  [Chat] Quota exceeded | ${currentAccountEmail} | ${quotaMsg.substring(0, 200)}`,
-			);
+			// so outer account rotation can pick another one immediately.
+			if (isAccountUnavailableError(err)) {
+				const quotaMsg = err.message || "Unknown quota error";
+				const policy = classifyRetryAction(err);
+				
+				// Single account: retry once after delay before giving up
+				if (isSingleAccount && !quotaRetried && attemptsLeft > 0) {
+					quotaRetried = true;
+					console.warn(
+						`⚠️  [Chat] Quota exceeded | ${currentAccountEmail} | Retrying in ${config.retry.baseDelayMs}ms...`,
+					);
+					await new Promise((resolve) =>
+						setTimeout(resolve, config.retry.baseDelayMs),
+					);
+					continue;
+				}
 
-			// Single account: retry once after delay before giving up
-			if (isSingleAccount && !quotaRetried && attemptsLeft > 0) {
-				quotaRetried = true;
+				// Log consolidated quota error with cooldown info
+				const cooldownSeconds = policy.accountCooldownMs 
+					? Math.round(policy.accountCooldownMs / 1000)
+					: 0;
+				const cooldownUntil = policy.accountCooldownMs 
+					? new Date(Date.now() + policy.accountCooldownMs)
+					: null;
+				const untilStr = cooldownUntil 
+					? ` | until=${formatDateTimeBR(cooldownUntil.getTime())}`
+					: "";
+				
 				console.warn(
-					`🔄 [Chat] Single account mode | Retrying in ${config.retry.baseDelayMs}ms...`,
+					`⚠️  [Chat] Quota exceeded | ${currentAccountEmail} | cooldown=${cooldownSeconds}s${untilStr} | ${quotaMsg.substring(0, 150)}`,
 				);
-				await new Promise((resolve) =>
-					setTimeout(resolve, config.retry.baseDelayMs),
+
+				markAccountFailed(currentAccountId);
+				markAccountRateLimited(
+					currentAccountId,
+					policy.accountCooldownMs,
+					policy.accountCooldownReason || "QuotaExceeded",
 				);
-				continue;
+				return { success: false, error: err };
 			}
 
-			const policy = classifyRetryAction(err);
-			markAccountRateLimited(
-				currentAccountId,
-				policy.accountCooldownMs,
-				policy.accountCooldownReason || "QuotaExceeded",
-			);
-			return { success: false, error: err };
-		}
-
 		const policy = classifyRetryAction(err);
+
+		// Escalating recovery for chat_in_progress:
+		// 1st: retry same chat after delay (policy default)
+		// 2nd: force new chat on same account with full prompt
+		// 3rd+: allow account switch
+		if (policy.reason === "chat_in_progress") {
+			chatInProgressCount++;
+			markAccountTemporarilyBusy(
+				currentAccountId,
+				config.retry.chatInProgressBusyMs,
+			);
+			if (chatInProgressCount >= 2 && params.useThreadNative) {
+				console.warn(
+					`🔄 [Chat] chat_in_progress escalation (${chatInProgressCount}) | forcing new chat on ${currentAccountEmail}`,
+				);
+				params.existingThread = null;
+				params.finalPrompt = params.fullPrompt;
+				params.messageCount = params.fullMessageCount ?? params.messageCount;
+				params.forceNewChat = true;
+			}
+			if (chatInProgressCount >= 3 && !isSingleAccount && accountSwitches < maxAccountSwitches) {
+				const nextAccount = getNextAvailableAccount(triedAccounts);
+				if (nextAccount && nextAccount.id !== currentAccountId) {
+					console.warn(
+						`🔄 [Chat] chat_in_progress escalation (${chatInProgressCount}) | switching ${currentAccountEmail} -> ${maskEmail(nextAccount.email)}`,
+					);
+					triedAccounts.add(currentAccountId);
+					currentAccountId = nextAccount.id;
+					currentAccountEmail = maskEmail(nextAccount.email);
+					accountSwitches++;
+					if (params.useThreadNative) {
+						params.existingThread = null;
+						params.finalPrompt = params.fullPrompt;
+						params.messageCount = params.fullMessageCount ?? params.messageCount;
+						params.forceNewChat = true;
+					}
+				}
+			}
+		}
 
 		// Prefer switching account for any retryable upstream error when possible
 		if (
@@ -850,6 +946,19 @@ async function tryCreateStreamWithRetry(
 			params.finalPrompt = params.fullPrompt;
 			params.messageCount = params.fullMessageCount ?? params.messageCount;
 			params.forceNewChat = true;
+		}
+
+		// Drop files on retry for invalid_input to isolate file-related errors
+		if (policy.dropFiles && params.allFiles.length > 0) {
+			console.warn(
+				`🗂️  [Chat] Dropping ${params.allFiles.length} file(s) on retry to isolate invalid_input error:`,
+				params.allFiles.map((f) => ({
+						name: f.name,
+						type: f.type,
+						size: f.size ?? "unknown",
+					})),
+			);
+			params.allFiles = [];
 		}
 
 		if (!policy.retryable || attemptsLeft <= 0) {

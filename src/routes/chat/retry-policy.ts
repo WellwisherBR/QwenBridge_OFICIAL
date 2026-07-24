@@ -6,6 +6,7 @@
  */
 
 import { config } from "../../core/config.ts";
+import { logger } from "../../core/logger.ts";
 import {
   QwenNetworkError,
   QwenUpstreamError,
@@ -28,6 +29,8 @@ export type RetryAction = {
   forceNewChat: boolean;
   /** Resend full conversation context (not just delta) */
   retryWithFullPrompt: boolean;
+  /** Drop attached files on retry (for invalid_input caused by bad attachments) */
+  dropFiles?: boolean;
   /** Suggested delay before next attempt */
   retryAfterMs: number;
   /** Optional short cooldown for the failing account */
@@ -43,6 +46,7 @@ export type RetryableStreamError = RetryableQwenStreamError & {
   forceNewChat?: boolean;
   retryWithFullPrompt?: boolean;
   switchAccount?: boolean;
+  dropFiles?: boolean;
 };
 
 function errMessage(err: unknown): string {
@@ -101,7 +105,6 @@ export function isTerminalLocalError(err: unknown): boolean {
 
   if (
     code === "invalid_api_key" ||
-    code === "bad_request" ||
     code === "authentication_error" ||
     message.includes("missing or invalid authorization") ||
     message.includes("invalid api key") ||
@@ -110,6 +113,21 @@ export function isTerminalLocalError(err: unknown): boolean {
     message.includes("no qwen accounts configured")
   ) {
     return true;
+  }
+
+  // bad_request from Qwen upstream is NOT terminal — it's a corrupted chat
+  // or invalid payload that can be recovered with a new chat + full prompt.
+  // Only treat as terminal when it's clearly a local proxy validation error.
+  if (code === "bad_request") {
+    const isQwenUpstream =
+      message.includes("qwen") ||
+      message.includes("upstream") ||
+      message.includes("invalid input") ||
+      message.includes("first message must not") ||
+      message.includes("entrada ou anexo");
+    if (!isQwenUpstream) {
+      return true;
+    }
   }
 
   return false;
@@ -232,6 +250,21 @@ export function isChatInProgressError(err: unknown): boolean {
 }
 
 /**
+ * Corrupted chat history: Qwen rejects because the first message in the
+ * upstream chat thread is an assistant message (broken parent_id chain).
+ * Recovery: force new chat + resend full prompt + switch account.
+ */
+export function isCorruptedChatHistoryError(err: unknown): boolean {
+  const message = errMessage(err).toLowerCase();
+  return (
+    message.includes("first message must not") ||
+    message.includes("first message must be") ||
+    message.includes("must not assistant message") ||
+    message.includes("must not be assistant")
+  );
+}
+
+/**
  * Generic recovery policy for create-stream + mid-stream failures.
  * Unknown upstream errors are retryable by default when enabled in config.
  */
@@ -275,17 +308,32 @@ export function classifyRetryAction(
   }
 
   // Specialized recoveries first (even if wrapped as RetryableQwenStreamError)
+    // Corrupted chat history must win over broad "invalid input" matches.
+    if (isCorruptedChatHistoryError(err)) {
+      return {
+        retryable: true,
+        switchAccount: true,
+        forceNewChat: true,
+        retryWithFullPrompt: true,
+        retryAfterMs: 0,
+        reason: "corrupted_chat_history",
+      };
+    }
+
     // Chat missing must win over broad "invalid input" substring matches.
     if (isChatNotExistError(err) || isChatInProgressError(err)) {
       const typed = err as RetryableStreamError;
       const inProgress = isChatInProgressError(err);
       return {
         retryable: true,
-        switchAccount: inProgress ? typed.switchAccount !== false : false,
-        forceNewChat: true,
-        retryWithFullPrompt: true,
+        // chat_in_progress: do NOT switch immediately — the account is just
+        // temporarily busy. Escalation to switch happens in tryCreateStreamWithRetry
+        // after repeated failures on the same account.
+        switchAccount: inProgress ? false : false,
+        forceNewChat: !inProgress, // chat_not_exist needs a new chat; in_progress retries same first
+        retryWithFullPrompt: !inProgress,
         retryAfterMs: inProgress
-          ? Math.min(typed.retryAfterMs ?? baseDelayMs, 1500)
+          ? (typed.retryAfterMs ?? config.retry.chatInProgressDelayMs)
           : (typed.retryAfterMs ?? 0),
         reason: inProgress ? "chat_in_progress" : "chat_not_exist",
       };
@@ -300,6 +348,7 @@ export function classifyRetryAction(
         retryWithFullPrompt: true,
         retryAfterMs: typed.retryAfterMs ?? baseDelayMs,
         reason: "invalid_input",
+        dropFiles: typed.dropFiles,
       };
     }
 
@@ -425,6 +474,7 @@ export function toRetryableStreamError(
   error.forceNewChat = merged.forceNewChat;
   error.retryWithFullPrompt = merged.retryWithFullPrompt;
   error.switchAccount = merged.switchAccount;
+  error.dropFiles = merged.dropFiles;
   return error;
 }
 
@@ -433,33 +483,54 @@ export function throwFromSseUpstreamError(
   errCode: string,
   errDetails: string,
 ): never {
-  console.error(
-    `[Upstream] Error | ${errCode} | ${errDetails.substring(0, 200)}`,
-  );
+  // Log upstream errors. Expected retryable codes (quota, rate limit, chat
+  // state) use warn level to avoid noisy stderr stack traces in production.
+  const expectedCodes = new Set([
+    "quota_limit",
+    "rate_limit",
+    "rate_limit_exceeded",
+    "chat_in_progress",
+    "invalid_input",
+  ]);
+  if (expectedCodes.has(errCode.toLowerCase())) {
+    logger.warn(`[Upstream] Error | ${errCode} | ${errDetails.substring(0, 200)}`);
+  } else {
+    console.error(
+      `[Upstream] Error | ${errCode} | ${errDetails.substring(0, 200)}`,
+    );
+  }
 
   // invalid_input keeps dedicated wording for logs/tests (not "chat is not exist")
-    const detailsLower = errDetails.toLowerCase();
-    const isChatMissing =
-      detailsLower.includes("is not exist") ||
-      detailsLower.includes("does not exist") ||
-      /\bnot exist\b/.test(detailsLower);
-    if (
-      !isChatMissing &&
-      (errCode.toLowerCase() === "invalid_input" ||
-        detailsLower.includes("entrada ou anexo inválido") ||
-        detailsLower.includes("invalid input") ||
-        detailsLower.includes("invalid attachment"))
-    ) {
-      const error = new RetryableQwenStreamError(
-        `Qwen retryable invalid input: ${errCode}: ${errDetails.substring(0, 200)}`,
-        config.retry.baseDelayMs,
-      ) as RetryableStreamError;
-      error.upstreamCode = errCode;
-      error.forceNewChat = true;
-      error.retryWithFullPrompt = true;
-      error.switchAccount = true;
-      throw error;
-    }
+  const detailsLower = errDetails.toLowerCase();
+  const isChatMissing =
+    detailsLower.includes("is not exist") ||
+    detailsLower.includes("does not exist") ||
+    /\bnot exist\b/.test(detailsLower);
+  if (
+    !isChatMissing &&
+    (errCode.toLowerCase() === "invalid_input" ||
+      detailsLower.includes("entrada ou anexo inválido") ||
+      detailsLower.includes("invalid input") ||
+      detailsLower.includes("invalid attachment"))
+  ) {
+    logger.warn("[Upstream] invalid_input mid-stream detected", {
+      code: errCode,
+      detailsLength: errDetails.length,
+      containsAttachment: detailsLower.includes("anexo") || detailsLower.includes("attachment"),
+      containsFile: detailsLower.includes("file") || detailsLower.includes("arquivo"),
+    });
+
+    const error = new RetryableQwenStreamError(
+      `Qwen retryable invalid input: ${errCode}: ${errDetails.substring(0, 200)}`,
+      config.retry.baseDelayMs,
+    ) as RetryableStreamError;
+    error.upstreamCode = errCode;
+    error.forceNewChat = true;
+    error.retryWithFullPrompt = true;
+    error.switchAccount = true;
+    error.dropFiles = true; // Drop files on retry to isolate file-related errors
+    throw error;
+  }
 
   if (
     errDetails.includes("FAIL_SYS_USER_VALIDATE") ||
